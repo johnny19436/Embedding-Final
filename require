@@ -1,0 +1,1 @@
+pip install adafruit-circuitpython-lsm6ds adafruit-circuitpython-lis3mdl adafruit-circuitpython-lps25 ahrs requests numpy
