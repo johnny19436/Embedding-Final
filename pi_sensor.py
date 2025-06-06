@@ -1,117 +1,84 @@
+import smbus2
 import time
-import board
-import adafruit_lsm6ds.lsm6ds33
-import adafruit_lis3mdl
-import adafruit_lps25
-import math
+import struct
 import requests
-import json
-from ahrs.filters import Madgwick
-import numpy as np
+import math
 
 # Server configuration
-SERVER_URL = "http://localhost:8000"  # Change this to your game server's IP
+SERVER_URL = "http://localhost:8000"
 
-# Initialize I2C
-i2c = board.I2C()
+ICM20948_ADDR = 0x68
+bus = smbus2.SMBus(1)
 
-# Initialize sensors
-try:
-    # LSM6DS33 - Accelerometer and Gyroscope
-    lsm6ds = adafruit_lsm6ds.lsm6ds33.LSM6DS33(i2c)
-    # LIS3MDL - Magnetometer
-    lis3mdl = adafruit_lis3mdl.LIS3MDL(i2c)
-    # LPS25 - Barometer (optional, for future altitude tracking)
-    lps25 = adafruit_lps25.LPS25(i2c)
-    
-    print("All sensors initialized successfully")
-except Exception as e:
-    print(f"Error initializing sensors: {e}")
-    raise
+REG_BANK_SEL = 0x7F
 
-# Initialize Madgwick filter for sensor fusion
-# 100 Hz sample rate
-madgwick = Madgwick(freq=100)
-q = np.array([1.0, 0.0, 0.0, 0.0])  # Initial quaternion
+# Registers
+ACCEL_XOUT_H = 0x2D
+GYRO_XOUT_H = 0x33
+WHO_AM_I = 0x00
 
-def get_sensor_data():
-    try:
-        # Get acceleration data (in m/s^2)
-        accel_x, accel_y, accel_z = lsm6ds.acceleration
-        
-        # Get gyroscope data (in rad/s)
-        gyro_x, gyro_y, gyro_z = [math.radians(x) for x in lsm6ds.gyro]
-        
-        # Get magnetometer data (in uT)
-        mag_x, mag_y, mag_z = lis3mdl.magnetic
-        
-        # Optional: Get pressure (in hPa) and temperature (in °C)
-        pressure = lps25.pressure
-        temperature = lps25.temperature
-        
-        return {
-            'accel': (accel_x, accel_y, accel_z),
-            'gyro': (gyro_x, gyro_y, gyro_z),
-            'mag': (mag_x, mag_y, mag_z),
-            'pressure': pressure,
-            'temperature': temperature
-        }
-    except Exception as e:
-        print(f"Error reading sensor data: {e}")
-        return None
+# Calibration offsets
+acc_offset = [0.02, 0.0, 0.0]  # g
+gyro_offset = [0.0, 0.0, 0.8]  # deg/s
+dt = 0.1  # 0.1 second per loop
 
-def update_orientation(accel, gyro, mag):
-    global q
-    # Update orientation estimate using Madgwick filter
-    q = madgwick.update(q, gyro, accel, mag)
-    
-    # Convert quaternion to Euler angles
-    roll = math.atan2(2 * (q[0] * q[1] + q[2] * q[3]), 1 - 2 * (q[1]**2 + q[2]**2))
-    pitch = math.asin(2 * (q[0] * q[2] - q[3] * q[1]))
-    yaw = math.atan2(2 * (q[0] * q[3] + q[1] * q[2]), 1 - 2 * (q[2]**2 + q[3]**2))
-    
-    # Convert to degrees
-    roll_deg = math.degrees(roll)
-    pitch_deg = math.degrees(pitch)
-    yaw_deg = math.degrees(yaw)
-    
-    return roll_deg, pitch_deg, yaw_deg
+velocity = [0.0, 0.0, 0.0]  # m/s
+distance = [0.0, 0.0, 0.0]  # m
+angles = [0.0, 0.0, 0.0]  # roll, pitch, yaw (degrees)
 
-print("Starting sensor reading loop...")
+def select_bank(bank):
+    bus.write_byte_data(ICM20948_ADDR, REG_BANK_SEL, bank << 4)
+
+def read_i2c_word(reg):
+    high = bus.read_byte_data(ICM20948_ADDR, reg)
+    low = bus.read_byte_data(ICM20948_ADDR, reg + 1)
+    value = struct.unpack('>h', bytes([high, low]))[0]
+    return value
+
+def initialize_icm20948():
+    select_bank(0)
+    whoami = bus.read_byte_data(ICM20948_ADDR, WHO_AM_I)
+    if whoami != 0xEA:
+        print(f"Unexpected WHO_AM_I value: {hex(whoami)}")
+    else:
+        print("ICM20948 detected")
+    bus.write_byte_data(ICM20948_ADDR, 0x06, 0x01)  # Wake up (PWR_MGMT_1)
+
+initialize_icm20948()
 
 try:
     while True:
-        # Get sensor data
-        sensor_data = get_sensor_data()
-        if sensor_data is None:
-            time.sleep(0.01)
-            continue
-            
-        # Update orientation
-        roll, pitch, yaw = update_orientation(
-            sensor_data['accel'],
-            sensor_data['gyro'],
-            sensor_data['mag']
-        )
-        
-        # Convert acceleration to g-force (1g = 9.81 m/s^2)
-        ax = sensor_data['accel'][0] / 9.81
-        ay = sensor_data['accel'][1] / 9.81
-        az = sensor_data['accel'][2] / 9.81
-        
-        # Prepare data in the format expected by the game
+        select_bank(0)
+
+        # Read accelerometer data
+        acc_raw = [read_i2c_word(ACCEL_XOUT_H + i*2) for i in range(3)]
+        acc_g = [acc_raw[i] / 16384.0 - acc_offset[i] for i in range(3)]
+        acc_ms2 = [g * 9.81 for g in acc_g]
+
+        # Read gyroscope data
+        gyro_raw = [read_i2c_word(GYRO_XOUT_H + i*2) for i in range(3)]
+        gyro_dps = [gyro_raw[i] / 131.0 - gyro_offset[i] for i in range(3)]
+
+        # Integrate to get angles
+        for i in range(3):
+            velocity[i] += acc_ms2[i] * dt
+            distance[i] += velocity[i] * dt + 0.5 * acc_ms2[i] * dt * dt
+            angles[i] += gyro_dps[i] * dt
+
+        roll, pitch, yaw = angles
+
+        # Prepare data for sending
         game_data = {
-            "o_alpha": yaw,      # Map to yaw (Z-axis rotation)
-            "o_beta": pitch,     # Map to pitch (X-axis rotation)
-            "o_gamma": roll,     # Map to roll (Y-axis rotation)
-            "ax": ax,           # Accelerometer X in g-force
-            "ay": ay,           # Accelerometer Y in g-force
-            "az": az,           # Accelerometer Z in g-force
-            # Additional data available but not used by game currently
-            "pressure": sensor_data['pressure'],
-            "temperature": sensor_data['temperature']
+            "o_alpha": yaw,       # yaw
+            "o_beta": pitch,      # pitch
+            "o_gamma": roll,      # roll
+            "ax": acc_g[0],       # X acceleration (g)
+            "ay": acc_g[1],       # Y acceleration (g)
+            "az": acc_g[2],       # Z acceleration (g)
+            "pressure": 0.0,      # placeholder
+            "temperature": 0.0    # placeholder
         }
-        
+
         # Send data to server
         try:
             response = requests.post(
@@ -123,17 +90,18 @@ try:
                 print(f"Error sending data: {response.status_code}")
         except Exception as e:
             print(f"Connection error: {e}")
-        
-        # Print values for debugging
-        print(f"Roll: {roll:.2f}° Pitch: {pitch:.2f}° Yaw: {yaw:.2f}°")
-        print(f"Accel: X={ax:.2f}g Y={ay:.2f}g Z={az:.2f}g")
-        print(f"Pressure: {sensor_data['pressure']:.1f}hPa, Temp: {sensor_data['temperature']:.1f}°C")
-        
-        time.sleep(0.01)  # 100Hz update rate
+
+        # Debug output
+        print(f"Acc (g): X={acc_g[0]:.2f}, Y={acc_g[1]:.2f}, Z={acc_g[2]:.2f}")
+        print(f"Gyro (deg/s): X={gyro_dps[0]:.2f}, Y={gyro_dps[1]:.2f}, Z={gyro_dps[2]:.2f}")
+        print(f"Angles: Roll={roll:.2f}, Pitch={pitch:.2f}, Yaw={yaw:.2f}")
+        print("-" * 60)
+
+        time.sleep(dt)
 
 except KeyboardInterrupt:
-    print("\nProgram stopped by user")
+    print("Stopped by user.")
 except Exception as e:
     print(f"Error: {e}")
 finally:
-    print("Cleaning up...") 
+    print("Cleaning up.")
