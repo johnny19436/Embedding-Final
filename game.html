@@ -22,6 +22,19 @@
         .info-item strong { display: inline-block; width: 100px; }
         .info-item span.error, .info-item span.waiting { color: #FFCC00; } 
 
+        #game-status {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            color: white;
+            background-color: rgba(0,0,0,0.6);
+            padding: 10px;
+            border-radius: 5px;
+            font-size: 0.85em;
+            width: 200px;
+            text-align: right;
+        }
+
         #instructions { 
             position: absolute;
             bottom: 10px;
@@ -33,6 +46,28 @@
             max-width: 350px; 
             font-size: 0.9em;
          }
+        .control-btn {
+            background-color: #4CAF50;
+            border: none;
+            color: white;
+            padding: 10px 20px;
+            text-align: center;
+            text-decoration: none;
+            display: inline-block;
+            font-size: 16px;
+            margin: 4px 2px;
+            cursor: pointer;
+            border-radius: 4px;
+            transition: background-color 0.3s;
+        }
+
+        .control-btn:hover {
+            background-color: #45a049;
+        }
+
+        .control-btn:active {
+            background-color: #3d8b40;
+        }
     </style>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/cannon.js/0.6.2/cannon.min.js"></script>
@@ -44,19 +79,28 @@
 </head>
 <body>
     <div id="info">
-        <div class="info-item"><strong>Status:</strong> <span id="status">Initializing...</span></div>
-        <hr>
-        <div class="info-item"><strong>Pi α (Yaw):</strong> <span id="phone_alpha" class="waiting">N/A</span>&deg;</div>
-        <div class="info-item"><strong>Pi β (Pitch):</strong> <span id="phone_beta" class="waiting">N/A</span>&deg;</div>
-        <div class="info-item"><strong>Pi γ (Roll):</strong> <span id="phone_gamma" class="waiting">N/A</span>&deg;</div>
-        <hr>
-        <div class="info-item"><strong>Bat Pitch (X):</strong> <span id="bat_pitch">0</span>&deg;</div>
-        <div class="info-item"><strong>Bat Yaw (Y):</strong> <span id="bat_yaw">0</span>&deg;</div>
-        <div class="info-item"><strong>Bat Roll (Z):</strong> <span id="bat_roll">0</span>&deg;</div>
-        <hr>
-        <div class="info-item"><strong>Accel:</strong> <span id="accelerationData">0,0,0</span></div>
-        <div class="info-item"><strong>Ball Vel:</strong> <span id="ball_velocity">0,0,0</span></div>
+        <h3>Sensor Data</h3>
+        <div class="info-item"><strong>Status:</strong> <span id="status">Waiting for sensor data...</span></div>
+        <div class="info-item"><strong>Orientation:</strong></div>
+        <div class="info-item">Alpha: <span id="phone_alpha">0</span>°</div>
+        <div class="info-item">Beta: <span id="phone_beta">0</span>°</div>
+        <div class="info-item">Gamma: <span id="phone_gamma">0</span>°</div>
+        <div class="info-item"><strong>Bat:</strong></div>
+        <div class="info-item">Pitch: <span id="bat_pitch">0</span>°</div>
+        <div class="info-item">Yaw: <span id="bat_yaw">0</span>°</div>
+        <div class="info-item">Roll: <span id="bat_roll">0</span>°</div>
+        <div class="info-item"><strong>Acceleration:</strong> <span id="accelerationData">0, 0, 0</span></div>
+        <div class="info-item"><strong>Ball Velocity:</strong> <span id="ball_velocity">0</span></div>
+        <button id="calibrateBtn" class="control-btn">Calibrate Sensor</button>
     </div>
+
+    <div id="game-status">
+        <h3>Game</h3>
+        <div class="info-item"><strong>Time Left:</strong> <span id="time_left">60</span>s</div>
+        <div class="info-item"><strong>Hits:</strong> <span id="hit_counter">0</span></div>
+        <button id="startGameBtn" class="control-btn">Start Game</button>
+    </div>
+
      <div id="instructions">
         1. Make sure the Raspberry Pi is running pi_sensor.py<br>
         2. Move the MPU6050 sensor to control the bat<br>
@@ -86,7 +130,7 @@
         let batMaterial, ballMaterial, groundMaterial; 
         const timeStep = 1 / 60; 
         let lastCallTime = performance.now();
-        const ballRadius = 0.35;
+        const ballRadius = 0.55;
         
         const batBoxHalfExtents = new CANNON.Vec3(
             0.2, 
@@ -96,28 +140,156 @@
 
         const batOrientationOffset = new THREE.Euler(0, 0, 0, 'YXZ'); 
         const batOffsetQuaternion = new THREE.Quaternion().setFromEuler(batOrientationOffset);
-        const initialBallPosition = new THREE.Vector3(0, 1.3, -6.5);
+        const initialBallPosition = new THREE.Vector3(5, 5, -16.5);
         let cannonDebugRendererInstance;
 
+        let lastSensorData = null;
+        let sensorDataQueue = [];
+        const MAX_QUEUE_SIZE = 3; // Keep only the most recent readings
+        let lastFrameTime = 0;
+        const TARGET_FRAMERATE = 60;
+        let lastReceivedTimestamp = 0;
+
+        // --- Game State Variables ---
+        let gameInProgress = false;
+        let timeLeft = 60;
+        let hitCounter = 0;
+        let gameTimerId = null;
+        let pitcherId = null;
+        let canHit = false; // Prevents multiple hits for one ball
+
+        // --- DOM Elements for Game Status ---
+        const timeLeftDisplay = document.getElementById('time_left');
+        const hitCounterDisplay = document.getElementById('hit_counter');
+        const startGameBtn = document.getElementById('startGameBtn');
+
+        function startGame() {
+            if (gameInProgress) return;
+            console.log("Starting game...");
+
+            // Reset state
+            gameInProgress = true;
+            timeLeft = 60;
+            hitCounter = 0;
+            canHit = false;
+
+            // Update UI
+            timeLeftDisplay.textContent = timeLeft;
+            hitCounterDisplay.textContent = hitCounter;
+            startGameBtn.disabled = true;
+            startGameBtn.textContent = 'Game in Progress';
+            statusDisplay.textContent = 'Game On!';
+
+            // Start the game timer
+            gameTimerId = setInterval(() => {
+                timeLeft--;
+                timeLeftDisplay.textContent = timeLeft;
+                if (timeLeft <= 0) {
+                    endGame();
+                }
+            }, 1000);
+
+            // Start pitching balls
+            pitcherId = setInterval(pitchBall, 5000);
+            pitchBall(); // Pitch the first ball immediately
+        }
+
+        function endGame() {
+            console.log("Game over!");
+            gameInProgress = false;
+            canHit = false;
+
+            // Stop timers
+            clearInterval(gameTimerId);
+            clearInterval(pitcherId);
+
+            // Update UI
+            startGameBtn.disabled = false;
+            startGameBtn.textContent = 'Start Game';
+            statusDisplay.textContent = `Game Over! Final Score: ${hitCounter}`;
+        }
+
+        function pitchBall() {
+            if (!gameInProgress) return;
+            console.log("Pitching a new ball...");
+
+            // Reset ball position and velocity
+            resetBall();
+
+            // --- Set a random X position for this pitch ---
+            const randomX = (Math.random() * 10) - 5; // Random value between -5 and 5
+            if (ballBody) {
+                ballBody.position.x = randomX;
+            }
+            if (ballMesh) {
+                ballMesh.position.x = randomX;
+            }
+            console.log(`Pitching from X: ${randomX.toFixed(2)}`);
+
+            // Set a short delay before the ball can be hit
+            setTimeout(() => {
+                canHit = true;
+            }, 250); // 250ms delay
+
+            // Give the ball an initial velocity towards the bat
+            const pitchVelocity = new CANNON.Vec3(
+                (Math.random() - 0.5) * 2, // Slight random X
+                (Math.random() - 0.5) * 1, // Slight random Y
+                25 // Z-velocity towards the player
+            );
+            ballBody.velocity.copy(pitchVelocity);
+        }
 
         function pollSensorData() {
             fetch('http://localhost:8000/get_sensor_data')
                 .then(response => response.json())
                 .then(data => {
-                    lastMotionData = data;
-                    
-                    // Update displays
+                    // Update sensor data displays
                     phoneAlphaDisplay.textContent = data.o_alpha.toFixed(1);
                     phoneBetaDisplay.textContent = data.o_beta.toFixed(1);
                     phoneGammaDisplay.textContent = data.o_gamma.toFixed(1);
-                    phoneAlphaDisplay.classList.remove('waiting');
-                    phoneBetaDisplay.classList.remove('waiting');
-                    phoneGammaDisplay.classList.remove('waiting');
+                    statusDisplay.textContent = 'Running';
                     
-                    accelerationDisplay.textContent = `X:${data.ax.toFixed(1)} Y:${data.ay.toFixed(1)} Z:${data.az.toFixed(1)}`;
+                    // Update bat orientation
+                    if (batMesh && data.quat) {
+                        console.log("Updating bat with quaternion:", data.quat);
+                        
+                        // Create quaternion from sensor data
+                        const sensorQuaternion = new THREE.Quaternion(
+                            data.quat[1],  // x
+                            data.quat[2],  // y
+                            data.quat[3],  // z
+                            data.quat[0]   // w
+                        );
+
+                        // Create base rotation (align bat with sensor)
+                        const baseRotation = new THREE.Quaternion().setFromEuler(
+                            new THREE.Euler(Math.PI/2, 0, 0, 'XYZ')
+                        );
+
+                        // Apply rotations
+                        batMesh.quaternion.copy(baseRotation).multiply(sensorQuaternion);
+
+                        // Update physics body
+                        if (batBody) {
+                            batBody.quaternion.copy(batMesh.quaternion);
+                            batBody.position.copy(batMesh.position);
+                        }
+
+                        // Update bat orientation display
+                        const euler = new THREE.Euler().setFromQuaternion(batMesh.quaternion, 'YXZ');
+                        batPitchDisplay.textContent = THREE.MathUtils.radToDeg(euler.x).toFixed(1);
+                        batYawDisplay.textContent = THREE.MathUtils.radToDeg(euler.y).toFixed(1);
+                        batRollDisplay.textContent = THREE.MathUtils.radToDeg(euler.z).toFixed(1);
+                    } else {
+                        console.log("Cannot update bat: batMesh exists:", !!batMesh, "quaternion data exists:", !!data.quat);
+                    }
                     
-                    // Update bat physics
-                    updateBatPhysicsOrientation(data);
+                    // Update acceleration display
+                    if (data.ax !== undefined) {
+                        accelerationDisplay.textContent = 
+                            `X:${data.ax.toFixed(2)} Y:${data.ay.toFixed(2)} Z:${data.az.toFixed(2)}`;
+                    }
                 })
                 .catch(error => {
                     console.error('Error fetching sensor data:', error);
@@ -130,13 +302,11 @@
 
             try {
                 if (typeof THREE === 'undefined') { 
-                    console.error("[GAME SCRIPT] THREE is not defined! Check script loading order.");
-                    statusDisplay.innerHTML = `<span class="error">Error: THREE.js failed to load.</span>`;
+                    console.error("[GAME SCRIPT] THREE is not defined!");
                     return; 
                 }
                 if (typeof CANNON === 'undefined') { 
-                    console.error("[GAME SCRIPT] CANNON is not defined! Check script loading order.");
-                    statusDisplay.innerHTML = `<span class="error">Error: Cannon.js failed to load.</span>`;
+                    console.error("[GAME SCRIPT] CANNON is not defined!");
                     return; 
                 }
 
@@ -144,13 +314,16 @@
                 scene.background = new THREE.Color(0x70C1FF); 
                 camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 1000);
                 camera.position.set(0, 1.7, 3.5); 
+                
                 renderer = new THREE.WebGLRenderer({ antialias: true });
                 renderer.setSize(window.innerWidth, window.innerHeight);
                 renderer.shadowMap.enabled = true;
                 renderer.shadowMap.type = THREE.PCFSoftShadowMap; 
                 document.body.appendChild(renderer.domElement);
+                
                 const ambientLight = new THREE.AmbientLight(0xffffff, 0.7);
                 scene.add(ambientLight);
+                
                 const directionalLight = new THREE.DirectionalLight(0xffffff, 0.9);
                 directionalLight.position.set(3, 8, 5);
                 directionalLight.castShadow = true;
@@ -161,8 +334,6 @@
                     controlsInstance = new THREE.OrbitControls(camera, renderer.domElement); 
                     controlsInstance.enableDamping = true;
                     controlsInstance.target.set(0, 1.2, 0); 
-                } else {
-                    console.warn("[GAME SCRIPT] THREE.OrbitControls is not defined.");
                 }
 
                 world = new CANNON.World();
@@ -197,19 +368,14 @@
                 }
 
                 // Start polling for sensor data
-                setInterval(pollSensorData, POLL_INTERVAL);
+                setInterval(pollSensorData, 16); // Poll at ~60Hz
                 
-                // Remove WebSocket connection code
-                statusDisplay.textContent = "Game Ready";
-
-                window.addEventListener('resize', onWindowResize, false);
-                window.addEventListener('keydown', handleKeyDown, false); 
+                // Start animation loop
+                animate();
                 
-                animate(); 
-
+                console.log("[GAME SCRIPT] Initialization complete");
             } catch (e) {
                 console.error("[GAME SCRIPT] CRITICAL ERROR IN INIT:", e);
-                statusDisplay.innerHTML = `<span class="error">Error during initialization. Check console.</span>`;
             }
         }
 
@@ -223,33 +389,40 @@
                         batMesh.position.set(0, 1.2, 0); 
                         batMesh.traverse(child => {
                             if (child.isMesh) {
-                                child.material = new THREE.MeshStandardMaterial({ color: 0x8B4513, roughness: 0.4, metalness: 0.2 });
-                                child.castShadow = true; child.receiveShadow = true; 
+                                child.material = new THREE.MeshStandardMaterial({ 
+                                    color: 0x8B4513, 
+                                    roughness: 0.4, 
+                                    metalness: 0.2 
+                                });
+                                child.castShadow = true;
+                                child.receiveShadow = true; 
                             }
                         });
-                        batMesh.quaternion.copy(batOffsetQuaternion); 
                         scene.add(batMesh);
                         createBatPhysicsBody(); 
+                        console.log("Bat mesh loaded and added to scene");
                     },
                     null, 
                     (error) => {
-                        console.error('Error loading bat model, using placeholder:', error);
-                        const placeholderWidth = batBoxHalfExtents.x * 2;
-                        const placeholderHeight = batBoxHalfExtents.y * 2; 
-                        const placeholderDepth = batBoxHalfExtents.z * 2;
-                        const batGeometry = new THREE.BoxGeometry(placeholderWidth, placeholderHeight, placeholderDepth);
-                        const batMaterialThreeJS = new THREE.MeshStandardMaterial({ color: 0x8B4513, roughness:0.5 }); 
+                        console.error('Error loading bat model:', error);
+                        // Create placeholder bat
+                        const batGeometry = new THREE.BoxGeometry(
+                            batBoxHalfExtents.x * 2,
+                            batBoxHalfExtents.y * 2,
+                            batBoxHalfExtents.z * 2
+                        );
+                        const batMaterialThreeJS = new THREE.MeshStandardMaterial({ 
+                            color: 0x8B4513, 
+                            roughness: 0.5 
+                        }); 
                         batMesh = new THREE.Mesh(batGeometry, batMaterialThreeJS);
-                        batMesh.geometry.translate(0, placeholderHeight / 2, 0); 
-                        batMesh.position.set(0, 1.2 - placeholderHeight / 2, 0); 
+                        batMesh.position.set(0, 1.2, 0); 
                         batMesh.castShadow = true;
-                        batMesh.quaternion.copy(batOffsetQuaternion);
                         scene.add(batMesh);
                         createBatPhysicsBody(); 
+                        console.log("Placeholder bat created");
                     }
                 );
-            } else {
-                 console.warn("[GAME SCRIPT] THREE.OBJLoader is not defined.");
             }
         }
         
@@ -300,37 +473,45 @@
                 const otherBody = contact.bi.id === ballBody.id ? contact.bj : contact.bi; 
                 
                 if (batBody && otherBody.id === batBody.id) { 
-                    console.log("[COLLISION] BALL HIT BAT CONFIRMED!");
-                    if (lastMotionData && batMesh) { 
-                        const swingMagnitude = Math.sqrt(
-                            (lastMotionData.ax || 0)**2 + (lastMotionData.ay || 0)**2 + (lastMotionData.az || 0)**2
-                        );
-                        if (swingMagnitude > ACCEL_THRESHOLD_SWING * 0.3) { 
-                            console.log("[COLLISION] Swing detected! Accel Mag:", swingMagnitude.toFixed(2));
-                            let batHitDirectionLocal = new THREE.Vector3(0, 0, -1); 
-                            let batHitDirectionWorld = batHitDirectionLocal.clone().applyQuaternion(batMesh.quaternion).normalize();
-                            let contactNormalAwayFromBall = new CANNON.Vec3(-contact.ni.x, -contact.ni.y, -contact.ni.z).unit();
-                            let hitDirection = new CANNON.Vec3(
-                                batHitDirectionWorld.x * 0.8 + contactNormalAwayFromBall.x * 0.2, 
-                                batHitDirectionWorld.y * 0.6 + contactNormalAwayFromBall.y * 0.4, 
-                                batHitDirectionWorld.z * 0.8 + contactNormalAwayFromBall.z * 0.2
-                            ).unit(); 
-                            const baseHitStrength = 3.0; 
-                            const swingForceFactor = 0.35; 
-                            let dynamicHitStrength = Math.min(baseHitStrength + (swingMagnitude * swingForceFactor), 35); 
-                            console.log(`[COLLISION] Dynamic Hit Strength: ${dynamicHitStrength.toFixed(2)}`);
-                            let impulse = hitDirection.scale(dynamicHitStrength);
-                            let contactPointOnBallWorld = new CANNON.Vec3();
-                            ballBody.pointToWorldFrame(contact.ri, contactPointOnBallWorld);
-                            ballBody.applyImpulse(impulse, contactPointOnBallWorld); 
-                            console.log("[COLLISION] Applied impulse:", impulse, "at world point:", contactPointOnBallWorld);
+                    if (canHit) {
+                        console.log("[COLLISION] BALL HIT BAT CONFIRMED!");
+                        canHit = false; // Prevent scoring multiple times on one ball
+                        hitCounter++;
+                        hitCounterDisplay.textContent = hitCounter;
+
+                        if (lastMotionData && batMesh) { 
+                            const swingMagnitude = Math.sqrt(
+                                (lastMotionData.ax || 0)**2 + (lastMotionData.ay || 0)**2 + (lastMotionData.az || 0)**2
+                            );
+                            if (swingMagnitude > ACCEL_THRESHOLD_SWING * 0.3) { 
+                                console.log("[COLLISION] Swing detected! Accel Mag:", swingMagnitude.toFixed(2));
+                                let batHitDirectionLocal = new THREE.Vector3(0, 0, -1); 
+                                let batHitDirectionWorld = batHitDirectionLocal.clone().applyQuaternion(batMesh.quaternion).normalize();
+                                let contactNormalAwayFromBall = new CANNON.Vec3(-contact.ni.x, -contact.ni.y, -contact.ni.z).unit();
+                                let hitDirection = new CANNON.Vec3(
+                                    batHitDirectionWorld.x * 0.8 + contactNormalAwayFromBall.x * 0.2, 
+                                    batHitDirectionWorld.y * 0.6 + contactNormalAwayFromBall.y * 0.4, 
+                                    batHitDirectionWorld.z * 0.8 + contactNormalAwayFromBall.z * 0.2
+                                ).unit(); 
+                                const baseHitStrength = 3.0; 
+                                const swingForceFactor = 0.35; 
+                                let dynamicHitStrength = Math.min(baseHitStrength + (swingMagnitude * swingForceFactor), 35); 
+                                console.log(`[COLLISION] Dynamic Hit Strength: ${dynamicHitStrength.toFixed(2)}`);
+                                let impulse = hitDirection.scale(dynamicHitStrength);
+                                let contactPointOnBallWorld = new CANNON.Vec3();
+                                ballBody.pointToWorldFrame(contact.ri, contactPointOnBallWorld);
+                                ballBody.applyImpulse(impulse, contactPointOnBallWorld); 
+                                console.log("[COLLISION] Applied impulse:", impulse, "at world point:", contactPointOnBallWorld);
+                            } else {
+                                console.log("[COLLISION] Bat collision, but swing not strong. Accel Mag:", swingMagnitude.toFixed(2));
+                                let buntImpulse = new CANNON.Vec3(-contact.ni.x, -contact.ni.y, -contact.ni.z).unit().scale(0.2); 
+                                ballBody.applyImpulse(buntImpulse, ballBody.position);
+                            }
                         } else {
-                            console.log("[COLLISION] Bat collision, but swing not strong. Accel Mag:", swingMagnitude.toFixed(2));
-                            let buntImpulse = new CANNON.Vec3(-contact.ni.x, -contact.ni.y, -contact.ni.z).unit().scale(0.2); 
-                            ballBody.applyImpulse(buntImpulse, ballBody.position);
+                            console.log("[COLLISION] Bat collision, but no recent motion data or batMesh missing.");
                         }
                     } else {
-                        console.log("[COLLISION] Bat collision, but no recent motion data or batMesh missing.");
+                        console.log("[COLLISION] Bat collision, but canHit is false.");
                     }
                 }
             });
@@ -385,24 +566,49 @@
         }
         
         function updateBatPhysicsOrientation(motionData) {
-            if (batMesh && batBody) { 
-                const alphaRad = THREE.MathUtils.degToRad(motionData.o_alpha);
-                const betaRad  = THREE.MathUtils.degToRad(motionData.o_beta);
-                const gammaRad = THREE.MathUtils.degToRad(motionData.o_gamma);
-                
-                const phoneOrientationEuler = new THREE.Euler(betaRad, gammaRad, alphaRad, 'YXZ'); 
-                const phoneOrientationQuaternion = new THREE.Quaternion().setFromEuler(phoneOrientationEuler);
-                
-                const targetQuaternion = new THREE.Quaternion().copy(batOffsetQuaternion).multiply(phoneOrientationQuaternion);
+            if (batMesh && batBody) {
+                // Use quaternion directly if available
+                if (motionData.quat) {
+                    const sensorQuaternion = new THREE.Quaternion(
+                        - motionData.quat[1],  // x
+                        motionData.quat[2],  // y
+                        motionData.quat[3],  // z
+                        motionData.quat[0]   // w (comes first in Python)
+                    );
 
-                batMesh.quaternion.slerp(targetQuaternion, 0.7); 
-                
-                batBody.quaternion.copy(batMesh.quaternion);
-                batBody.position.copy(batMesh.position); 
+                    // Apply base orientation and sensor quaternion
+                    batMesh.quaternion.copy(batOffsetQuaternion).multiply(sensorQuaternion);
+                    
+                    // Update physics body
+                    batBody.quaternion.copy(batMesh.quaternion);
+                    batBody.position.copy(batMesh.position);
 
-                batPitchDisplay.textContent = (THREE.MathUtils.radToDeg(batMesh.rotation.x)).toFixed(1);
-                batYawDisplay.textContent = (THREE.MathUtils.radToDeg(batMesh.rotation.y)).toFixed(1);
-                batRollDisplay.textContent = (THREE.MathUtils.radToDeg(batMesh.rotation.z)).toFixed(1);
+                    // Update display (convert quaternion to Euler for display only)
+                    const euler = new THREE.Euler().setFromQuaternion(batMesh.quaternion, 'YXZ');
+                    batPitchDisplay.textContent = (THREE.MathUtils.radToDeg(euler.x)).toFixed(1);
+                    batYawDisplay.textContent = (THREE.MathUtils.radToDeg(euler.y)).toFixed(1);
+                    batRollDisplay.textContent = (THREE.MathUtils.radToDeg(euler.z)).toFixed(1);
+                } else {
+                    // Fallback to Euler angles if quaternion not available
+                    const alphaRad = THREE.MathUtils.degToRad(-motionData.o_alpha);
+                    const betaRad = THREE.MathUtils.degToRad(-motionData.o_beta);
+                    const gammaRad = THREE.MathUtils.degToRad(-motionData.o_gamma);
+                    
+                    const orientationEuler = new THREE.Euler(betaRad, gammaRad, alphaRad, 'YXZ');
+                    const orientationQuaternion = new THREE.Quaternion().setFromEuler(orientationEuler);
+                    
+                    batMesh.quaternion.copy(batOffsetQuaternion).multiply(orientationQuaternion);
+                    batBody.quaternion.copy(batMesh.quaternion);
+                    batBody.position.copy(batMesh.position);
+
+                    batPitchDisplay.textContent = (THREE.MathUtils.radToDeg(batMesh.rotation.x)).toFixed(1);
+                    batYawDisplay.textContent = (THREE.MathUtils.radToDeg(batMesh.rotation.y)).toFixed(1);
+                    batRollDisplay.textContent = (THREE.MathUtils.radToDeg(batMesh.rotation.z)).toFixed(1);
+                }
+                
+                // Update acceleration display
+                accelerationDisplay.textContent = 
+                    `X:${motionData.ax.toFixed(2)} Y:${motionData.ay.toFixed(2)} Z:${motionData.az.toFixed(2)}`;
             }
         }
 
@@ -413,28 +619,37 @@
         }
 
         function animate() {
-            try {
-                requestAnimationFrame(animate);
-                const currentTime = performance.now();
-                let deltaTime = (currentTime - lastCallTime) / 1000;
-                deltaTime = Math.min(deltaTime, timeStep * 3); 
-                lastCallTime = currentTime;
+            requestAnimationFrame(animate);
 
+            try {
+                const currentTime = performance.now();
+                const deltaTime = (currentTime - lastFrameTime) / 1000;
+                lastFrameTime = currentTime;
+
+                // Update physics world
                 if (world) {
-                    world.step(timeStep, deltaTime, 5); 
+                    world.step(1/60);
+
+                    // Update ball position and velocity display
                     if (ballMesh && ballBody) {
                         ballMesh.position.copy(ballBody.position);
                         ballMesh.quaternion.copy(ballBody.quaternion);
-                        ballVelocityDisplay.textContent = `X:${ballBody.velocity.x.toFixed(1)} Y:${ballBody.velocity.y.toFixed(1)} Z:${ballBody.velocity.z.toFixed(1)}`;
+                        ballVelocityDisplay.textContent = 
+                            `X:${ballBody.velocity.x.toFixed(1)} Y:${ballBody.velocity.y.toFixed(1)} Z:${ballBody.velocity.z.toFixed(1)}`;
                     }
-                    if (cannonDebugRendererInstance && typeof cannonDebugRendererInstance.update === 'function') { 
+
+                    // Update debug renderer if available
+                    if (cannonDebugRendererInstance && typeof cannonDebugRendererInstance.update === 'function') {
                         cannonDebugRendererInstance.update();
                     }
                 }
-                if (controlsInstance) controlsInstance.update(); 
-                if (renderer && scene && camera) { 
+
+                // Update controls and render
+                if (controlsInstance) controlsInstance.update();
+                if (renderer && scene && camera) {
                     renderer.render(scene, camera);
                 }
+
             } catch (e) {
                 console.error("[GAME SCRIPT] Error in animation loop:", e);
             }
@@ -445,6 +660,38 @@
         } else {
             init(); 
         }
+
+        // Add calibration function
+        async function calibrateSensor() {
+            try {
+                const response = await fetch('http://localhost:8000/calibrate', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    }
+                });
+                
+                if (response.ok) {
+                    const result = await response.json();
+                    document.getElementById('status').textContent = 'Calibrated!';
+                    // Reset status message after 2 seconds
+                    setTimeout(() => {
+                        document.getElementById('status').textContent = 'Running';
+                    }, 2000);
+                } else {
+                    document.getElementById('status').textContent = 'Calibration failed!';
+                }
+            } catch (error) {
+                console.error('Error during calibration:', error);
+                document.getElementById('status').textContent = 'Calibration error!';
+            }
+        }
+
+        // Add event listener for calibration button
+        document.getElementById('calibrateBtn').addEventListener('click', calibrateSensor);
+        
+        // Add event listener for start game button
+        startGameBtn.addEventListener('click', startGame);
 
     </script>
 </body>
